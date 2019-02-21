@@ -1,0 +1,237 @@
+---
+title: "Rstanarm - easy implementation of Bayesian analysis"
+author: "Philip Dixon"
+date: "February 17, 2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rstanarm)
+library(lme4)
+par(mar=c(3,3,0,0)+0.2, mgp=c(2,0.8,0))
+set.seed(583916502)
+```
+
+## Why consider a Baysian analysis?  
+  * Jarad (Lunchinators, 8 Feb 2019): for the interpretation  
+    + Credible intervals are what we all want confidence intervals to be
+  * Other reasons  
+    + Account for all sources of uncertainty (more below)  
+    + Inference on derived quantities (see below)  
+    + Small sample inference for many problems (get rid of the z score)  
+    + Can easily fit more realistic biological models (hierarchical modeling, not discussed here)
+
+## The Bayesian paradigm:  
+  * prior + likelihood + data -> posterior  
+$$ f(\theta \mid data) = \frac{f(data \mid \theta) \: g(\theta)}
+{\int f(data \mid \theta) \: g(\theta) } $$
+The integral in the denominator can be very difficult!  Could be very high dimensional.
+
+Long ago (pre 1990):  Bayes restricted to combinations of prior and model (likelihood) with  analytic integrals (conjugate priors)   
+1990's: MCMC revolution.  Can sample from the posterior distribution without integration  
+   * Gibbs sampler, Metropolis-Hasting sampler  
+
+### How do I do a Bayesian analysis?  
+  1. Think about how the data relate to my question(s)? i.e., what are the relevant parameters?  
+  2. Write out an appropriate model. specifies how data relate to parameters  
+  3. Think about what I believe before seeing the data (prior distribution(s) for parameters)  
+
+### Then  
+  1. Do some math, write your own samplers  
+  2. BUGS / WinBUGS: code the model and priors, requires loops  
+    * RWinBUGS: R interface to WinBUGS. Very inefficient.    
+  3. JAGS: better implementation, still code the model and priors  
+    * rjags: R interface to JAGS - much smoother than RwinBUGS  
+  4. STAN: new samplers (Hamiltonian MC), much faster!  
+    * RStan: R interface to STAN - I haven't used  
+    * rstanarm: uses R modeling language to write models  
+
+### rstanarm: Implements many R models, including  
+  1. Linear models  
+  2. Generalized linear models  
+  3. Linear mixed effect models  
+  4. many others
+
+## Simple example: Regress pH on logtime  
+```{r slr}
+meat <- read.table('meat.txt', header=T)
+meat$logtime <- log(meat$time)
+with(meat, plot(logtime, ph))
+meat.lm <- lm(ph ~ logtime, data=meat)
+summary(meat.lm)$coefficients
+confint(meat.lm)
+```
+
+```{r slrstan, cache=TRUE}
+meat.stan <- stan_glm(
+    ph ~ logtime,
+    family=gaussian,
+    data=meat,
+    chains = 4,
+    cores = 4
+    )
+```
+Explanation of code:  
+   * stan modeling functions are stan_(R function), e.g., stan_lm, stan_glm, stan_lmer  
+   * write model as you would write the R model, including data=  
+   * glm with family=gaussian is an lm  
+   * stan_lm requires priors (specify r^2 for each variable)  
+   * stan_glm/gaussian allows different priors and has a reasonable default  
+   * chains= specifies how many independent chains to sample, 3 or 4 are common choices  
+   * cores= specifies how many cores to use for parallel processing.  Do not exceed 1/2 to 2/3 number on your machine
+
+How many cores does my machine have?
+```{r cores}
+library(parallel)
+detectCores()
+```
+What are the default prior distributions?
+```{r priors}
+prior_summary(meat.stan)
+```
+
+Change by adding prior = (for regression coeff.) prior_intercept = (for intercept) and/or prior_aux = (for sigma) to the stan_glm call
+
+stan_lm has a different set of default priors: based on expected r^2 for each variable.  I find stan_glm more intuitive.
+
+## What can I do once I fit the model?  
+### Diagnostics:  
+  * biggest concern is whether the sampler has converged to the posterior distribution  
+  * default is 1000 samples "warmup" (discarded), keep next 1000 samples (both per chain)   
+  * want chains to look similar  
+  * Rhat measures discrepancy between chains.  Want close to 1.  
+     + Over 1.1 is usually considered bad unless model really hard to sample  
+  * how many samples: want small MC standard error  
+  * Graphical exploration - rstanarm shiny app
+
+```{r shiny, eval=FALSE}
+launch_shinystan(meat.stan)
+```
+There are also posterior predictive checks.  compare data to predictions from the posterior distribution.  
+
+## Summarize results, once fit looks reasonable
+```{r stanresults}
+summary(meat.stan, digits=2)
+```
+One caution:  
+   * rstanarm centers all X variables - reduces correlation of estimates  
+     - sampling the posterior is easier  
+   * models without interactions or polynomial terms: centering only changes the intercept.  rstanarm documentation says intercept estimates are adjusted back to uncentered version.
+  * can turn off the centering if you want to 
+     - add sparse=TRUE to stan call.
+
+This is not obvious.  sparse= specifies whether the X'X matrix is sparse (lots of 0's), so estimates independent, which happens when centered.  But sparse=TRUE means NOT sparse.
+
+Can extract all the samples of the posterior distribution.    
+Very useful if you want a transformation of parameters, e.g. X when pH crosses 6.0
+```{r max}
+meat.post <- as.matrix(meat.stan)
+meat.b0 <- meat.post[,1]
+meat.b1 <- meat.post[,2]
+time6 <- exp((6-meat.b0)/meat.b1)
+
+plot(density(time6),  main='', xlab='X for max Y', col=4)
+meat.beta <- coef(meat.lm)
+points(exp((6-meat.beta[1])/meat.beta[2]), 0, pch=19, col=4)
+
+summary(time6)
+quantile(time6, c(0.025, 0.05, 0.5, 0.95, 0.975) )
+arrows(quantile(time6, 0.025), 0, quantile(time6, 0.975), 0,
+  angle=90, length=0.1, code=3, col=4  )
+```
+
+Why does rstanarm want to center variables - look at correlations in the posterior distributions.  4000 samples, only look at first 500.
+```{r pairs}
+pairs(meat.post[1:500,], pch='.')
+```
+
+# Examples of other models fit with rstanarm  
+## Generalized linear model  
+### benefit of Bayes - appropriate inferences for small samples 
+```{r donner, cache=TRUE}
+donner <- read.csv('donner.csv')
+donner.glm <- glm(survival ~ age + femc, data=donner,     family=binomial)
+summary(donner.glm)
+confint(donner.glm)
+donner.stan <- stan_glm(
+    survival ~ age + femc,
+    family=binomial,
+    data=donner,
+    chains = 4,
+    cores = 4
+    )
+summary(donner.stan, digits=2)
+
+# probability that a male more likely to die than a female of same age= P[femc < 0]
+donner.post <- as.matrix(donner.stan)
+mean(donner.post[,3] < 0)
+```
+## Incomplete blocks, with random block effects  
+### Benefit of Bayes - do not assume block variance is known exactly 
+```{r ib, cache=TRUE}
+ib <- read.csv('IBtest.csv')
+ib.stan <- stan_lmer(
+    y ~ trt.f + (1 | block.f),
+    data=ib,
+    chains = 4,
+    cores = 4
+    )
+ib.stan <- stan_lmer(
+    y ~ trt.f + (1 | block.f),
+    data=ib,
+    chains = 4,
+    cores = 4,
+    adapt_delta = 0.98
+    )
+    
+prior_summary(ib.stan)
+summary(ib.stan, digits=2, 
+  pars=c('(Intercept)', 'trt.fb', 'sigma'),
+  regex_pars='Sigma*')
+```
+## Overdispersed count data  
+### Benefit of Bayes - do not assume known amount of overdispersion
+```{r pod, cache=TRUE}
+pod <- read.csv('PODtest.csv')
+pod.glmm <- glmer(y ~ xc + (1|obs), data=pod, family=poisson)
+summary(pod.glmm)
+confint(pod.glmm)
+
+pod.stan <- stan_glmer(
+    y ~ xc + (1 | obs),
+    data=pod,
+    family=poisson,
+    chains = 4,
+    cores = 4
+    )
+summary(pod.stan, digits=2,
+  pars=c('(Intercept)', 'xc'),
+  regex_pars='Sigma*')
+```
+lmer() and glmer() condition on the estimated variance components.  
+   I.e., inference on fixed effect parameters considers those variance components to be known precisely.
+   Bayes accounts for that uncertainty  
+   Some models (e.g. RCBD) variance has no effect on estimates, just uncertainty  
+   Other models (e.g. OD, IB), different variances changes the estimates - here's where Bayes matters  
+   
+## Final words:    
+  the prior is an important part of the model: be critical of both  
+  from the WinBUGS reference manual: BEWARE: MCMC sampling can be dangerous  
+  
+## Resources:  
+  * rstanarm:  
+    + Articles: Muth, Oravecz and Gabry (2018) User-friendly Bayesian regression modeling: a tutorial with rstandarm and shinystan.  The Quantitative Methods for Psychology 14(2):99-119 with code at https://osf.io/ebz2f/
+    + STAN project has wonderful vignettes about using rstanarm.  Start with  
+    http://mc-stan.org/rstanarm/articles/rstanarm.html  
+    + Then look at the model-specific vignettes (vignettes tab)  
+    mixed models are in the Group Specific Terms vignette
+  * Bayes in Ecology: now lots of great books    
+    + Barker and Link: Bayesian Inference (my favorite)
+    + McCarthy: Bayesian Methods for Ecology  
+    + King et al.: Bayesian Analysis for Population Ecology  
+    + Korner-Niervergelt et al.: Bayesian Analysis in Ecology using linear models with R, BUGS and Stan
+    + Parent and Rivot: Introduction to Hierarchical Bayesian Modeling for Ecological Data
+  
+    
+    
